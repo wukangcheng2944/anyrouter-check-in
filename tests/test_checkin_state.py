@@ -4,7 +4,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from checkin import generate_balance_hash
+from checkin import browser_cookies_for_url, generate_balance_hash
 
 
 def test_balance_hash_changes_when_quota_changes():
@@ -32,3 +32,17 @@ def test_balance_hash_is_stable_for_equivalent_balances():
 	}
 
 	assert generate_balance_hash(left) == generate_balance_hash(right)
+
+
+def test_browser_cookies_are_filtered_to_target_domain():
+	cookies = [
+		{'name': 'session', 'value': 'agentrouter-session', 'domain': 'agentrouter.org'},
+		{'name': 'acw_tc', 'value': 'waf-cookie', 'domain': '.agentrouter.org'},
+		{'name': 'user_session', 'value': 'github-secret', 'domain': 'github.com'},
+		{'name': 'evil', 'value': 'wrong-suffix', 'domain': 'evilagentrouter.org'},
+	]
+
+	result = browser_cookies_for_url(cookies, 'https://agentrouter.org')
+
+	assert result == {'session': 'agentrouter-session', 'acw_tc': 'waf-cookie'}
+	assert 'github-secret' not in result.values()

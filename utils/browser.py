@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast
 
 from utils.debug import debug_print, is_debug_enabled
 from utils.popups import dismiss_popups, setup_popup_guard
@@ -24,6 +24,12 @@ EMAIL_LOGIN_BUTTON_NAMES = (
 	re.compile(r'Email or Username', re.I),
 	re.compile(r'Sign in with Email', re.I),
 	re.compile(r'Sign in with Email or Username', re.I),
+)
+GITHUB_LOGIN_BUTTON_NAMES = (re.compile(r'GitHub', re.I),)
+GITHUB_LOGIN_ENTRY_SELECTORS = (
+	'.semi-card button:has(.semi-icon-github-logo)',
+	'.semi-card button:has([class*="github" i])',
+	'button:has-text("GitHub")',
 )
 EMAIL_LOGIN_ENTRY_SELECTORS = (
 	'.semi-card button:has(.semi-icon-mail):not(form.semi-form button)',
@@ -143,6 +149,14 @@ _OPEN_EMAIL_FORM_JS = """() => {
 class BrowserLoginResult:
 	cookies: dict[str, str]
 	api_user: str | None = None
+	checked_in: bool | None = None
+
+
+@dataclass(frozen=True)
+class GithubOAuthCallback:
+	user: dict
+	checked_in: bool
+	message: str = ''
 
 
 @dataclass(frozen=True)
@@ -200,7 +214,12 @@ class _EphemeralBrowserContext:
 			await self._browser.close()
 
 
-async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: bool = False) -> BrowserContext:
+async def launch_login_context(
+	settings: BrowserLoginSettings,
+	*,
+	use_proxy: bool = False,
+	storage_state: dict | None = None,
+) -> BrowserContext | _EphemeralBrowserContext:
 	_ensure_binary_path(settings)
 
 	launch_kwargs: dict = {
@@ -222,14 +241,18 @@ async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: boo
 		print('[WARN] Provider requires proxy but CHECKIN_PROXY_URL is not set')
 
 	if settings.persist_profile:
+		if storage_state is not None:
+			raise ValueError('storage_state cannot be combined with a persistent browser profile')
 		from cloakbrowser import launch_persistent_context_async
 
 		settings.profile_dir.mkdir(parents=True, exist_ok=True)
-		return await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs)
+		return cast('BrowserContext', await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs))
 
 	from cloakbrowser import launch_async
 
 	context_kwargs = {'viewport': launch_kwargs.pop('viewport')}
+	if storage_state is not None:
+		context_kwargs['storage_state'] = storage_state
 	browser = await launch_async(**launch_kwargs)
 	context = await browser.new_context(**context_kwargs)
 	return _EphemeralBrowserContext(context, browser)
@@ -295,7 +318,11 @@ async def wait_for_site_ready(page: Page, timeout_ms: int = WAF_READY_TIMEOUT_MS
 		print(f'[INFO] Dismissed {closed} popup dialog(s)')
 
 
-async def _wait_for_optional_load_state(page: Page, state: str, timeout_ms: int) -> bool:
+async def _wait_for_optional_load_state(
+	page: Page,
+	state: Literal['domcontentloaded', 'load', 'networkidle'],
+	timeout_ms: int,
+) -> bool:
 	try:
 		await page.wait_for_load_state(state, timeout=timeout_ms)
 		return True
@@ -474,6 +501,111 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 		debug_print(f'[WARN] Login verification failed: current URL={page.url}')
 		print('[WARN] Login verification failed')
 	return None
+
+
+def parse_github_oauth_callback(payload: object) -> GithubOAuthCallback:
+	"""解析 AgentRouter 的 GitHub OAuth 回调，签到状态缺失时拒绝猜测。"""
+	if not isinstance(payload, dict):
+		raise ValueError('GitHub OAuth callback did not return a JSON object')
+	if payload.get('success') is not True:
+		message = str(payload.get('message') or 'GitHub OAuth callback failed')
+		raise ValueError(message)
+
+	user = payload.get('data')
+	if not isinstance(user, dict) or not user.get('id'):
+		raise ValueError('GitHub OAuth callback did not include an authenticated user')
+
+	checked_in = user.get('checked_in')
+	if not isinstance(checked_in, bool):
+		raise ValueError('GitHub OAuth callback did not include checked_in status')
+
+	return GithubOAuthCallback(
+		user=user,
+		checked_in=checked_in,
+		message=str(payload.get('message') or ''),
+	)
+
+
+async def _click_github_login_entry(page: Page) -> bool:
+	await _dismiss_blocking_overlays(page)
+	for selector in GITHUB_LOGIN_ENTRY_SELECTORS:
+		buttons = page.locator(selector)
+		for index in range(await buttons.count()):
+			button = buttons.nth(index)
+			try:
+				if await button.is_visible() and await _click_locator(button):
+					return True
+			except Exception:  # nosec B112
+				continue
+
+	for pattern in GITHUB_LOGIN_BUTTON_NAMES:
+		for scope in (page.locator('.semi-card'), page):
+			try:
+				button = scope.get_by_role('button', name=pattern).first
+				if await button.is_visible() and await _click_locator(button):
+					return True
+			except Exception:  # nosec B112
+				continue
+	return False
+
+
+async def _handle_github_authorize_page(page: Page) -> bool:
+	"""仅在 GitHub OAuth 授权页点击授权；登录/2FA 页面一律失败关闭。"""
+	from urllib.parse import urlparse
+
+	parsed = urlparse(page.url)
+	if parsed.hostname not in {'github.com', 'www.github.com'}:
+		return False
+	if parsed.path.startswith('/login') and not parsed.path.startswith('/login/oauth/authorize'):
+		raise RuntimeError('GitHub browser session expired or requires interactive verification')
+	if not parsed.path.startswith('/login/oauth/authorize'):
+		return False
+
+	selectors = (
+		'form[action*="/login/oauth/authorize"] button[name="authorize"]',
+		'form[action*="/login/oauth/authorize"] button[type="submit"]',
+		'form[action*="/login/oauth/authorize"] input[type="submit"]',
+	)
+	button = await _first_visible_locator(page, selectors)
+	return bool(button and await _click_locator(button))
+
+
+async def login_with_github_oauth(page: Page, timeout_ms: int) -> GithubOAuthCallback:
+	"""点击 GitHub 登录并捕获 AgentRouter OAuth 回调中的 checked_in。"""
+	callback_payload: object | None = None
+	callback_event = asyncio.Event()
+
+	async def on_response(response) -> None:
+		nonlocal callback_payload
+		if '/api/oauth/github?' not in response.url:
+			return
+		try:
+			callback_payload = await response.json()
+		except Exception:
+			callback_payload = {'success': False, 'message': f'Invalid OAuth response (HTTP {response.status})'}
+		callback_event.set()
+
+	page.on('response', on_response)
+	try:
+		if not await _click_github_login_entry(page):
+			raise TimeoutError('Cannot find the GitHub login button')
+
+		deadline = time.monotonic() + timeout_ms / 1000
+		authorize_clicked = False
+		while time.monotonic() < deadline and not callback_event.is_set():
+			if not authorize_clicked:
+				authorize_clicked = await _handle_github_authorize_page(page)
+			try:
+				await asyncio.wait_for(callback_event.wait(), timeout=1)
+			except TimeoutError:
+				continue
+
+		if not callback_event.is_set():
+			raise TimeoutError('Timed out waiting for the AgentRouter GitHub OAuth callback')
+	finally:
+		page.remove_listener('response', on_response)
+
+	return parse_github_oauth_callback(callback_payload)
 
 
 async def wait_for_waf_ready(page: Page, timeout_ms: int = WAF_READY_TIMEOUT_MS) -> None:

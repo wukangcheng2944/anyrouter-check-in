@@ -11,5 +11,6 @@ htmlcov
 balance_hash.txt
 .browser_profiles
 checkin_screenshots
+.github_oauth_state
 
 .DS_Store

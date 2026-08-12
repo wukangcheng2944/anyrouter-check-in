@@ -9,6 +9,8 @@ import json
 import os
 import sys
 from datetime import datetime
+from typing import Any, Iterable
+from urllib.parse import urlparse
 
 if hasattr(sys.stdout, 'reconfigure'):
 	sys.stdout.reconfigure(line_buffering=True)
@@ -26,6 +28,7 @@ from utils.browser import (
 	launch_login_context,
 	load_browser_login_settings,
 	login_with_email_form,
+	login_with_github_oauth,
 	navigate_login_page,
 	prepare_browser_page,
 	save_login_screenshot,
@@ -36,6 +39,7 @@ from utils.browser import (
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
 from utils.notify import notify
+from utils.oauth_state import load_github_storage_state
 from utils.proxy import get_playwright_proxy, get_proxy_server
 
 load_dotenv()
@@ -85,6 +89,23 @@ def parse_cookies(cookies_data):
 				cookies_dict[key] = value
 		return cookies_dict
 	return {}
+
+
+def browser_cookies_for_url(cookies: Iterable[Any], target_url: str) -> dict[str, str]:
+	"""只提取目标域 Cookie，防止跨站浏览器登录态被扁平转发。"""
+	target_host = (urlparse(target_url).hostname or '').lower()
+	if not target_host:
+		raise ValueError(f'Invalid cookie target URL: {target_url}')
+
+	result: dict[str, str] = {}
+	for cookie in cookies:
+		cookie_domain = str(cookie.get('domain') or '').lstrip('.').lower()
+		cookie_name = cookie.get('name')
+		cookie_value = cookie.get('value')
+		domain_matches = target_host == cookie_domain or target_host.endswith(f'.{cookie_domain}')
+		if cookie_domain and domain_matches and cookie_name and cookie_value:
+			result[str(cookie_name)] = str(cookie_value)
+	return result
 
 
 async def get_waf_cookies_with_browser(
@@ -214,9 +235,7 @@ async def login_with_credentials(
 			return None
 
 		cookies = await context.cookies()
-		all_cookies = {
-			cookie.get('name'): cookie.get('value') for cookie in cookies if cookie.get('name') and cookie.get('value')
-		}
+		all_cookies = browser_cookies_for_url(cookies, provider_config.domain)
 		api_user = str(user_profile['id']) if user_profile.get('id') is not None else None
 
 		success_msg = f'[SUCCESS] {account_name}: Login successful, got {len(all_cookies)} cookies'
@@ -230,6 +249,73 @@ async def login_with_credentials(
 		print(f'[FAILED] {account_name}: Error during login: {e}')
 		if page is not None:
 			await save_login_screenshot(page, provider_name, account_name, 'login-error')
+		await context.close()
+		return None
+
+
+async def login_with_github_session(
+	account_name: str,
+	provider_config,
+	provider_name: str,
+) -> BrowserLoginResult | None:
+	"""使用 GitHub-only 浏览器登录态完成 AgentRouter OAuth 登录。"""
+	print(f'[PROCESSING] {account_name}: Logging in with GitHub OAuth...')
+	try:
+		storage_state = load_github_storage_state()
+	except ValueError as exc:
+		print(f'[FAILED] {account_name}: {exc}')
+		return None
+
+	login_url = f'{provider_config.domain}{provider_config.login_path}'
+	settings = load_browser_login_settings(account_name, provider_name, persist_profile=False)
+	timeout_ms = settings.wait_timeout_ms
+
+	try:
+		context = await launch_login_context(
+			settings,
+			use_proxy=provider_config.use_proxy,
+			storage_state=storage_state,
+		)
+	except Exception as exc:
+		print(f'[FAILED] {account_name}: Browser launch failed: {exc}')
+		return None
+
+	page = None
+	try:
+		page = await context.new_page()
+		await prepare_browser_page(page)
+		await navigate_login_page(
+			page,
+			login_url,
+			timeout_ms,
+			provider=provider_name,
+			account_name=account_name,
+		)
+		await save_login_screenshot(page, provider_name, account_name, 'before-github-oauth')
+
+		callback = await login_with_github_oauth(page, timeout_ms)
+		console_url = f'{provider_config.domain}/console'
+		user_profile = await verify_browser_login(page, console_url, timeout_ms)
+		if not user_profile:
+			raise RuntimeError('GitHub OAuth completed but /api/user/self could not be verified')
+		if str(callback.user.get('id')) != str(user_profile.get('id')):
+			raise RuntimeError('GitHub OAuth callback user does not match /api/user/self')
+
+		cookies = await context.cookies()
+		all_cookies = browser_cookies_for_url(cookies, provider_config.domain)
+		api_user = str(user_profile['id'])
+		claim_status = 'new credit claimed' if callback.checked_in else 'already checked in / not due'
+		print(f'[SUCCESS] {account_name}: GitHub OAuth login verified ({claim_status})')
+		await context.close()
+		return BrowserLoginResult(
+			cookies=all_cookies,
+			api_user=api_user,
+			checked_in=callback.checked_in,
+		)
+	except Exception as exc:
+		print(f'[FAILED] {account_name}: GitHub OAuth login failed: {exc}')
+		if page is not None:
+			await save_login_screenshot(page, provider_name, account_name, 'github-oauth-error')
 		await context.close()
 		return None
 
@@ -365,8 +451,19 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	# 邮箱密码优先
 	all_cookies = None
 	resolved_api_user: str | None = None
+	login_checked_in: bool | None = None
 	auth_method = None
-	if account.has_login_credentials():
+	if account.uses_github_oauth():
+		print(f'[INFO] {account_name}: Attempting GitHub OAuth login...')
+		login_result = await login_with_github_session(account_name, provider_config, account.provider)
+		if login_result:
+			all_cookies = login_result.cookies
+			resolved_api_user = login_result.api_user
+			login_checked_in = login_result.checked_in
+			auth_method = 'github oauth'
+		else:
+			return False, None, None
+	elif account.has_login_credentials():
 		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
 		assert account.email is not None and account.password is not None
 		login_result = await login_with_credentials(
@@ -402,6 +499,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		account_name,
 		provider_config,
 		api_user_override=resolved_api_user,
+		login_checked_in=login_checked_in,
 		use_proxy=provider_config.use_proxy,
 	)
 
@@ -413,6 +511,7 @@ def run_check_in_requests(
 	provider_config,
 	*,
 	api_user_override: str | None = None,
+	login_checked_in: bool | None = None,
 	use_proxy: bool = False,
 ) -> tuple[bool, dict | None, dict | None]:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
@@ -462,7 +561,12 @@ def run_check_in_requests(
 
 			user_info_after = get_user_info(client, headers, user_info_url)
 			if user_info_after and user_info_after.get('success'):
-				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
+				if login_checked_in is True:
+					print(f'[SUCCESS] {account_name}: AgentRouter awarded new credit during login')
+				elif login_checked_in is False:
+					print(f'[INFO] {account_name}: Login succeeded; credit was already claimed or is not due yet')
+				else:
+					print(f'[INFO] {account_name}: Login/session verified; no explicit check-in status was available')
 				return True, user_info_before, user_info_after
 			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
 			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')

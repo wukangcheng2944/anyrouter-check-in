@@ -72,8 +72,7 @@
   {
     "name": "备用账号",
     "provider": "agentrouter",
-    "email": "account2@example.com",
-    "password": "account2_password"
+    "auth_method": "github"
   }
 ]
 ```
@@ -83,6 +82,7 @@
 - `email` + `password`：推荐的浏览器登录方式，登录成功后会自动获取 cookies 与用户标识
 - `cookies`：兼容旧版的 session cookies 登录方式
 - `api_user`：session cookies 登录时用于请求头的 new-api-user 参数；邮箱密码登录可省略
+- `auth_method: "github"`：AgentRouter 专用，通过预先导出的 GitHub 浏览器登录态完成 OAuth；不需要邮箱、密码、cookies 或 api_user
 - `provider` (可选)：指定使用的服务商，默认为 `anyrouter`
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
 
@@ -91,6 +91,46 @@
 - 如果未提供 `provider` 字段，默认使用 `anyrouter`（向后兼容）
 - 如果未提供 `name` 字段，会使用 `Account 1`、`Account 2` 等默认名称
 - `anyrouter` 与 `agentrouter` 配置已内置，无需填写
+
+### AgentRouter 使用 GitHub OAuth
+
+AgentRouter 的每日额度由“重新登录”触发。GitHub Actions 无法用仓库自带的 `GITHUB_TOKEN` 代表个人账号完成第三方 OAuth，因此需要先在本机人工授权一次，并把**仅包含 GitHub 域 Cookie**的压缩登录态保存为 Environment Secret。
+
+1. 在本地安装依赖和 CloakBrowser：
+
+```bash
+uv sync --frozen
+uv run python -m cloakbrowser install
+```
+
+2. 运行导出工具：
+
+```bash
+uv run python scripts/export_github_oauth_state.py
+```
+
+在打开的浏览器里点击“使用 GitHub 继续”，完成 GitHub 登录、二次验证和 AgentRouter 授权。工具只导出 `github.com` 域的登录态，AgentRouter Session 不会写入 Secret。
+
+3. 打开仓库 `Settings -> Environments -> production -> Environment secrets`，新增：
+
+- `AGENTROUTER_GITHUB_STATE`：填写 `.github_oauth_state/agentrouter-github-state.secret` 的完整单行内容
+- `ANYROUTER_ACCOUNTS`：
+
+```json
+[
+  {
+    "name": "AgentRouter GitHub",
+    "provider": "agentrouter",
+    "auth_method": "github"
+  }
+]
+```
+
+4. 删除本地 `.github_oauth_state` 目录，手动运行一次 Action 验证。
+
+每次 Action 都创建一个不含 AgentRouter Session 的临时浏览器，利用 GitHub 登录态重新完成 OAuth，并以 `/api/oauth/github` 回调中的 `checked_in` 字段判断本次是否获得额度。若 GitHub 登录态过期、要求重新验证或回调缺少签到状态，任务会失败并通知，不会把“可以读取用户信息”误报成签到成功。
+
+> **安全警告：** `AGENTROUTER_GITHUB_STATE` 等同于高敏感 GitHub 浏览器会话凭据。建议使用只服务于 AgentRouter 的专用 GitHub 账号、启用 `production` 环境保护、限制能够修改工作流的人员，绝不要把该值放入仓库文件、Actions Cache、日志或截图。发现泄露时应立即在 GitHub 的会话设置中撤销登录并重新生成。
 
 如果使用 session cookies 登录，接下来获取 cookies 与 api_user 的值。
 
