@@ -188,23 +188,32 @@ class AccountConfig:
 
 def load_accounts_config() -> list[AccountConfig] | None:
 	"""从环境变量加载账号配置"""
-	accounts_str = os.getenv('ANYROUTER_ACCOUNTS')
-	if not accounts_str:
-		print('ERROR: ANYROUTER_ACCOUNTS environment variable not found')
-		return None
+	accounts_data = []
+	configured_envs = []
+	for env_name in ('ANYROUTER_ACCOUNTS', 'AGENTROUTER_ACCOUNTS'):
+		accounts_str = os.getenv(env_name)
+		if not accounts_str:
+			continue
 
-	try:
-		accounts_data = json.loads(accounts_str)
-	except json.JSONDecodeError as e:
-		print(f'ERROR: ANYROUTER_ACCOUNTS JSON 解析失败: {e}')
-		print('HINT: 常见原因 - 末尾多余逗号、使用了单引号、包含注释、或换行格式问题')
-		return None
-
-	try:
-		if not isinstance(accounts_data, list):
-			print('ERROR: Account configuration must use array format [{}]')
+		configured_envs.append(env_name)
+		try:
+			env_accounts = json.loads(accounts_str)
+		except json.JSONDecodeError as e:
+			print(f'ERROR: {env_name} JSON 解析失败: {e}')
+			print('HINT: 常见原因 - 末尾多余逗号、使用了单引号、包含注释、或换行格式问题')
 			return None
 
+		if not isinstance(env_accounts, list):
+			print(f'ERROR: {env_name} must use array format [{{}}]')
+			return None
+
+		accounts_data.extend(env_accounts)
+
+	if not configured_envs:
+		print('ERROR: ANYROUTER_ACCOUNTS or AGENTROUTER_ACCOUNTS environment variable not found')
+		return None
+
+	try:
 		accounts = []
 		for i, account_dict in enumerate(accounts_data):
 			if not isinstance(account_dict, dict):

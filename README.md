@@ -114,7 +114,7 @@ uv run python scripts/export_github_oauth_state.py
 3. 打开仓库 `Settings -> Environments -> production -> Environment secrets`，新增：
 
 - `AGENTROUTER_GITHUB_STATE`：填写 `.github_oauth_state/agentrouter-github-state.secret` 的完整单行内容
-- `ANYROUTER_ACCOUNTS`：
+- `AGENTROUTER_ACCOUNTS`：独立保存 AgentRouter 账号，不会覆盖已有的 `ANYROUTER_ACCOUNTS`
 
 ```json
 [
@@ -125,6 +125,8 @@ uv run python scripts/export_github_oauth_state.py
   }
 ]
 ```
+
+运行时会依次合并 `ANYROUTER_ACCOUNTS` 和 `AGENTROUTER_ACCOUNTS`。如果没有 AnyRouter 账号，也可以只配置后者。
 
 4. 删除本地 `.github_oauth_state` 目录，手动运行一次 Action 验证。
 
