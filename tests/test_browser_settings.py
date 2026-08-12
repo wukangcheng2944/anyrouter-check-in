@@ -1,9 +1,10 @@
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
-from utils.browser import launch_login_context, load_browser_login_settings
+from utils.browser import launch_login_context, load_browser_login_settings, parse_github_oauth_callback
 
 
 def test_browser_login_settings_records_profile_persistence(monkeypatch, tmp_path):
@@ -41,7 +42,7 @@ async def test_launch_login_context_uses_persistent_context_when_enabled(monkeyp
 		persist_profile=settings.persist_profile,
 	)
 
-	result = await launch_login_context(settings)
+	result: Any = await launch_login_context(settings)
 
 	assert result is context
 	assert calls['profile_dir'] == str(settings.profile_dir)
@@ -92,9 +93,49 @@ async def test_launch_login_context_closes_browser_for_ephemeral_context(monkeyp
 		persist_profile=settings.persist_profile,
 	)
 
-	context = await launch_login_context(settings)
+	context: Any = await launch_login_context(settings)
 	await context.close()
 
 	assert context.closed is True
 	assert browser.closed is True
 	assert not settings.profile_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_launch_login_context_passes_storage_state_to_ephemeral_context(monkeypatch, tmp_path):
+	class FakeBrowser:
+		def __init__(self):
+			self.context_kwargs = {}
+
+		async def new_context(self, **kwargs):
+			self.context_kwargs = kwargs
+			return SimpleNamespace(close=lambda: None)
+
+		async def close(self):
+			pass
+
+	browser = FakeBrowser()
+
+	async def fake_launch_async(**kwargs):
+		return browser
+
+	monkeypatch.setitem(sys.modules, 'cloakbrowser', SimpleNamespace(launch_async=fake_launch_async))
+	settings = load_browser_login_settings('Account 1', 'agentrouter', persist_profile=False)
+	storage_state: dict[str, list] = {'cookies': [], 'origins': []}
+
+	await launch_login_context(settings, storage_state=storage_state)
+
+	assert browser.context_kwargs['storage_state'] is storage_state
+
+
+def test_parse_github_oauth_callback_requires_checked_in():
+	with pytest.raises(ValueError, match='checked_in'):
+		parse_github_oauth_callback({'success': True, 'data': {'id': 123}})
+
+
+@pytest.mark.parametrize('checked_in', [True, False])
+def test_parse_github_oauth_callback_preserves_checkin_status(checked_in):
+	result = parse_github_oauth_callback({'success': True, 'data': {'id': 123, 'checked_in': checked_in}})
+
+	assert result.checked_in is checked_in
+	assert result.user['id'] == 123

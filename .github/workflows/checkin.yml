@@ -10,6 +10,10 @@ on:
         default: false
         type: boolean
 
+concurrency:
+  group: checkin-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   checkin:
     runs-on: ubuntu-latest
@@ -95,6 +99,7 @@ jobs:
         CHECKIN_HUMANIZE: true
         CHECKIN_WAIT_TIMEOUT_MS: 120000
         ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
+        AGENTROUTER_GITHUB_STATE: ${{ secrets.AGENTROUTER_GITHUB_STATE }}
         PROVIDERS: ${{ secrets.PROVIDERS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}
         EMAIL_USER: ${{ secrets.EMAIL_USER }}

@@ -155,6 +155,7 @@ class AccountConfig:
 	name: str | None = None
 	email: str | None = None
 	password: str | None = None
+	auth_method: Literal['github'] | None = None
 
 	@classmethod
 	def from_dict(cls, data: dict, index: int) -> 'AccountConfig':
@@ -169,11 +170,16 @@ class AccountConfig:
 			name=name if name else None,
 			email=data.get('email'),
 			password=data.get('password'),
+			auth_method=data.get('auth_method'),
 		)
 
 	def has_login_credentials(self) -> bool:
 		"""是否配置了邮箱密码登录"""
 		return bool(self.email and self.password)
+
+	def uses_github_oauth(self) -> bool:
+		"""是否使用预先导出的 GitHub 浏览器登录态完成 OAuth 登录。"""
+		return self.auth_method == 'github'
 
 	def get_display_name(self, index: int) -> str:
 		"""获取显示名称"""
@@ -205,9 +211,17 @@ def load_accounts_config() -> list[AccountConfig] | None:
 				print(f'ERROR: Account {i + 1} configuration format is incorrect')
 				return None
 
+			auth_method = account_dict.get('auth_method')
+			if auth_method not in {None, 'github'}:
+				print(f'ERROR: Account {i + 1} auth_method must be "github" or omitted')
+				return None
+			if auth_method == 'github' and account_dict.get('provider', 'anyrouter') != 'agentrouter':
+				print(f'ERROR: Account {i + 1} GitHub OAuth is currently supported only for agentrouter')
+				return None
+
 			if 'api_user' not in account_dict:
 				has_login = account_dict.get('email') and account_dict.get('password')
-				if not has_login:
+				if not has_login and auth_method != 'github':
 					print(
 						f'ERROR: Account {i + 1} missing required field (api_user) - only email+password login can omit it'
 					)
@@ -216,8 +230,8 @@ def load_accounts_config() -> list[AccountConfig] | None:
 			has_cookies = 'cookies' in account_dict and account_dict['cookies']
 			has_login = account_dict.get('email') and account_dict.get('password')
 
-			if not has_cookies and not has_login:
-				print(f'ERROR: Account {i + 1} must have either cookies or email+password')
+			if not has_cookies and not has_login and auth_method != 'github':
+				print(f'ERROR: Account {i + 1} must have cookies, email+password, or auth_method=github')
 				return None
 
 			if 'name' in account_dict and not account_dict['name']:

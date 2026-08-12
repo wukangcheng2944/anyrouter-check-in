@@ -1,6 +1,6 @@
 import json
 
-from utils.config import AppConfig, ProviderConfig
+from utils.config import AppConfig, ProviderConfig, load_accounts_config
 
 
 def test_builtin_provider_profile_persistence_defaults(monkeypatch):
@@ -47,3 +47,24 @@ def test_provider_from_dict_inherits_profile_persistence_from_defaults():
 	)
 
 	assert provider.persist_profile is True
+
+
+def test_github_oauth_account_needs_no_password_cookie_or_api_user(monkeypatch):
+	monkeypatch.setenv(
+		'ANYROUTER_ACCOUNTS',
+		json.dumps([{'name': 'AgentRouter', 'provider': 'agentrouter', 'auth_method': 'github'}]),
+	)
+
+	accounts = load_accounts_config()
+
+	assert accounts is not None
+	assert accounts[0].uses_github_oauth()
+
+
+def test_github_oauth_account_rejects_other_provider(monkeypatch):
+	monkeypatch.setenv(
+		'ANYROUTER_ACCOUNTS',
+		json.dumps([{'provider': 'anyrouter', 'auth_method': 'github'}]),
+	)
+
+	assert load_accounts_config() is None
