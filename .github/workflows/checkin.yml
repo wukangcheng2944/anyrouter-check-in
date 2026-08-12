@@ -9,13 +9,36 @@ on:
         required: false
         default: false
         type: boolean
+      network_probe:
+        description: 仅比较不同 GitHub Runner 对 AgentRouter 官方 API 的访问结果
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: checkin-${{ github.repository }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  network-probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.network_probe
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v6
+
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+
+    - name: 探测 AgentRouter 官方 API
+      run: python scripts/probe_agentrouter_network.py
+
   checkin:
+    if: github.event_name != 'workflow_dispatch' || !inputs.network_probe
     runs-on: ubuntu-latest
     environment: production
     env:
