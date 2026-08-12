@@ -316,7 +316,7 @@ uv run python scripts/export_github_oauth_state.py
 
 ## 代理配置（可选）
 
-内置的 `agentrouter` 默认 `use_proxy: true`。如果你的运行环境访问该平台不稳定，可以在 GitHub Actions 中配置 mihomo 订阅代理。
+内置的 `agentrouter` 默认 `use_proxy: false`。如果你有能通过平台访问验证的代理出口，可以在 GitHub Actions 中配置 mihomo 订阅代理，并通过 `PROVIDERS` 将 `agentrouter.use_proxy` 设为 `true`。
 
 在仓库 Settings -> Environments -> production -> Environment secrets 中添加：
 

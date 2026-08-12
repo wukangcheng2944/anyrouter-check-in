@@ -1,8 +1,5 @@
 name: AnyRouter 自动签到
 on:
-  push:
-    branches:
-      - codex/agentrouter-direct-oauth
   schedule:
     - cron: '0 */6 * * *'
   workflow_dispatch:
@@ -24,7 +21,7 @@ concurrency:
 
 jobs:
   network-probe:
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.network_probe)
+    if: github.event_name == 'workflow_dispatch' && inputs.network_probe
     strategy:
       fail-fast: false
       matrix:
@@ -41,7 +38,7 @@ jobs:
       run: python scripts/probe_agentrouter_network.py
 
   checkin:
-    if: github.event_name != 'push' && (github.event_name != 'workflow_dispatch' || !inputs.network_probe)
+    if: github.event_name != 'workflow_dispatch' || !inputs.network_probe
     runs-on: ubuntu-latest
     environment: production
     env:
