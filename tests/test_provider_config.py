@@ -68,3 +68,34 @@ def test_github_oauth_account_rejects_other_provider(monkeypatch):
 	)
 
 	assert load_accounts_config() is None
+
+
+def test_agentrouter_accounts_are_merged_without_overwriting_anyrouter(monkeypatch):
+	monkeypatch.setenv(
+		'ANYROUTER_ACCOUNTS',
+		json.dumps([{'name': 'AnyRouter', 'cookies': {'session': 'session'}, 'api_user': '1'}]),
+	)
+	monkeypatch.setenv(
+		'AGENTROUTER_ACCOUNTS',
+		json.dumps([{'name': 'AgentRouter', 'provider': 'agentrouter', 'auth_method': 'github'}]),
+	)
+
+	accounts = load_accounts_config()
+
+	assert accounts is not None
+	assert [account.name for account in accounts] == ['AnyRouter', 'AgentRouter']
+	assert accounts[1].uses_github_oauth()
+
+
+def test_agentrouter_accounts_can_be_used_without_anyrouter_secret(monkeypatch):
+	monkeypatch.delenv('ANYROUTER_ACCOUNTS', raising=False)
+	monkeypatch.setenv(
+		'AGENTROUTER_ACCOUNTS',
+		json.dumps([{'provider': 'agentrouter', 'auth_method': 'github'}]),
+	)
+
+	accounts = load_accounts_config()
+
+	assert accounts is not None
+	assert len(accounts) == 1
+	assert accounts[0].provider == 'agentrouter'
