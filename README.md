@@ -132,6 +132,8 @@ uv run python scripts/export_github_oauth_state.py
 
 每次 Action 都创建一个不含 AgentRouter Session 的临时浏览器，利用 GitHub 登录态重新完成 OAuth，并以 `/api/oauth/github` 回调中的 `checked_in` 字段判断本次是否获得额度。若 GitHub 登录态过期、要求重新验证或回调缺少签到状态，任务会失败并通知，不会把“可以读取用户信息”误报成签到成功。
 
+如果公共 Runner 的登录页被滑块访问验证替换，程序会改用 AgentRouter 公开的 `/api/status`、`/api/oauth/state` 和 `/api/oauth/github` 完成同一标准 OAuth 流程，并严格校验回跳域名、路径、state、用户与 `checked_in`。该回退不处理滑块，也不依赖代理。
+
 > **安全警告：** `AGENTROUTER_GITHUB_STATE` 等同于高敏感 GitHub 浏览器会话凭据。建议使用只服务于 AgentRouter 的专用 GitHub 账号、启用 `production` 环境保护、限制能够修改工作流的人员，绝不要把该值放入仓库文件、Actions Cache、日志或截图。发现泄露时应立即在 GitHub 的会话设置中撤销登录并重新生成。
 
 如果使用 session cookies 登录，接下来获取 cookies 与 api_user 的值。

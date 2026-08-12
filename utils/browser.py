@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
+from urllib.parse import parse_qs, urlencode, urlparse
+
+import httpx
 
 from utils.debug import debug_print, is_debug_enabled
 from utils.popups import dismiss_popups, setup_popup_guard
@@ -59,6 +62,14 @@ FORM_ACTION_TIMEOUT_MS = 15_000
 EMAIL_TAB_TIMEOUT_MS = 8_000
 WAF_READY_TIMEOUT_MS = 30_000
 SESSION_WAIT_TIMEOUT_MS = 45_000
+AGENTROUTER_BACKUP_DOMAIN = 'https://ps.air-outer.com'
+ACCESS_VERIFICATION_PATTERNS = (
+	'Access Verification',
+	'Please slide to verify',
+	'slide to complete the verification',
+	'请进行验证',
+	'为了更好的访问体验',
+)
 
 _VISIBLE_CHECK_JS = """
 	const isVisible = (el) => {
@@ -150,6 +161,7 @@ class BrowserLoginResult:
 	cookies: dict[str, str]
 	api_user: str | None = None
 	checked_in: bool | None = None
+	request_domain: str | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +169,18 @@ class GithubOAuthCallback:
 	user: dict
 	checked_in: bool
 	message: str = ''
+
+
+@dataclass(frozen=True)
+class DirectGithubOAuthResult:
+	callback: GithubOAuthCallback
+	user_profile: dict
+	cookies: dict[str, str]
+	request_domain: str
+
+
+class AccessVerificationError(RuntimeError):
+	"""站点 HTML 被访问验证页替代。"""
 
 
 @dataclass(frozen=True)
@@ -345,6 +369,20 @@ async def _wait_for_login_shell(page: Page, timeout_ms: int) -> bool:
 		return False
 
 
+def is_access_verification_text(text: str) -> bool:
+	"""识别 AgentRouter/阿里云访问验证文案。"""
+	lowered = text.lower()
+	return any(pattern.lower() in lowered for pattern in ACCESS_VERIFICATION_PATTERNS)
+
+
+async def _is_access_verification_page(page: Page) -> bool:
+	try:
+		body_text = await page.locator('body').inner_text(timeout=5_000)
+	except Exception:  # nosec B110
+		return False
+	return is_access_verification_text(body_text)
+
+
 async def navigate_login_page(
 	page: Page,
 	login_url: str,
@@ -352,10 +390,9 @@ async def navigate_login_page(
 	*,
 	provider: str = '',
 	account_name: str = '',
+	raise_on_access_verification: bool = False,
 ) -> None:
 	"""预热站点、导航登录页并等待 SPA 渲染完成。"""
-	from urllib.parse import urlparse
-
 	parsed = urlparse(login_url)
 	base_url = f'{parsed.scheme}://{parsed.netloc}/'
 	attempt_timeout = min(timeout_ms, 60_000)
@@ -374,6 +411,8 @@ async def navigate_login_page(
 		print(f'[INFO] Navigating login page (attempt {attempt + 1}/3): {login_url}')
 		await page.goto(login_url, wait_until='load', timeout=attempt_timeout)
 		await _settle_page(page, 5, 20_000)
+		if raise_on_access_verification and await _is_access_verification_page(page):
+			raise AccessVerificationError('Login page was replaced by access verification')
 
 		if await _wait_for_login_shell(page, attempt_timeout):
 			await wait_for_site_ready(page, timeout_ms)
@@ -526,6 +565,60 @@ def parse_github_oauth_callback(payload: object) -> GithubOAuthCallback:
 	)
 
 
+def parse_github_oauth_client_id(payload: object) -> str:
+	"""从公开状态接口提取 GitHub OAuth client ID。"""
+	if not isinstance(payload, dict) or payload.get('success') is not True:
+		raise ValueError('AgentRouter status did not return a successful response')
+	data = payload.get('data')
+	client_id = data.get('github_client_id') if isinstance(data, dict) else None
+	if not isinstance(client_id, str) or not client_id.strip():
+		raise ValueError('AgentRouter status did not include github_client_id')
+	return client_id.strip()
+
+
+def parse_github_oauth_state(payload: object) -> str:
+	"""解析官方 OAuth state，拒绝空值和异常响应。"""
+	if not isinstance(payload, dict) or payload.get('success') is not True:
+		raise ValueError('AgentRouter OAuth state request failed')
+	state = payload.get('data')
+	if not isinstance(state, str) or not state.strip():
+		raise ValueError('AgentRouter OAuth state response was empty')
+	return state.strip()
+
+
+def parse_github_oauth_redirect(url: str, provider_domain: str, expected_state: str) -> tuple[str, str]:
+	"""校验 GitHub 回跳目标并提取一次性 code/state。"""
+	redirect = urlparse(url)
+	provider = urlparse(provider_domain)
+	if redirect.scheme != provider.scheme or redirect.netloc != provider.netloc:
+		raise ValueError('GitHub OAuth redirect returned to an unexpected origin')
+	if redirect.path != '/oauth/github':
+		raise ValueError('GitHub OAuth redirect used an unexpected path')
+	query = parse_qs(redirect.query)
+	code = query.get('code', [''])[0]
+	state = query.get('state', [''])[0]
+	if not code or not state:
+		raise ValueError('GitHub OAuth redirect did not include code and state')
+	if state != expected_state:
+		raise ValueError('GitHub OAuth redirect state did not match the request')
+	return code, state
+
+
+async def _read_json_response(response, label: str) -> object:
+	try:
+		return await response.json()
+	except Exception as exc:
+		status = getattr(response, 'status', 'unknown')
+		raise ValueError(f'{label} did not return JSON (HTTP {status})') from exc
+
+
+def _read_httpx_json_response(response: httpx.Response, label: str) -> object:
+	try:
+		return response.json()
+	except Exception as exc:
+		raise ValueError(f'{label} did not return JSON (HTTP {response.status_code})') from exc
+
+
 async def _click_github_login_entry(page: Page) -> bool:
 	await _dismiss_blocking_overlays(page)
 	for selector in GITHUB_LOGIN_ENTRY_SELECTORS:
@@ -551,8 +644,6 @@ async def _click_github_login_entry(page: Page) -> bool:
 
 async def _handle_github_authorize_page(page: Page) -> bool:
 	"""仅在 GitHub OAuth 授权页点击授权；登录/2FA 页面一律失败关闭。"""
-	from urllib.parse import urlparse
-
 	parsed = urlparse(page.url)
 	if parsed.hostname not in {'github.com', 'www.github.com'}:
 		return False
@@ -606,6 +697,87 @@ async def login_with_github_oauth(page: Page, timeout_ms: int) -> GithubOAuthCal
 		page.remove_listener('response', on_response)
 
 	return parse_github_oauth_callback(callback_payload)
+
+
+async def login_with_github_oauth_direct(
+	page: Page,
+	provider_domain: str,
+	timeout_ms: int,
+) -> DirectGithubOAuthResult:
+	"""登录页被 WAF 替换时，通过 AgentRouter 官方 API 完成同一 GitHub OAuth 流程。"""
+	request_timeout = min(timeout_ms, 60_000)
+	client: httpx.AsyncClient | None = None
+	client_id = ''
+	state = ''
+	request_domain = ''
+	last_error: Exception | None = None
+	for candidate in dict.fromkeys((provider_domain, AGENTROUTER_BACKUP_DOMAIN)):
+		candidate_client = httpx.AsyncClient(
+			base_url=candidate,
+			follow_redirects=True,
+			timeout=request_timeout / 1000,
+			trust_env=False,
+		)
+		try:
+			status_response = await candidate_client.get('/api/status')
+			client_id = parse_github_oauth_client_id(_read_httpx_json_response(status_response, 'AgentRouter status'))
+			state_response = await candidate_client.get('/api/oauth/state', params={'mode': 'login'})
+			state = parse_github_oauth_state(_read_httpx_json_response(state_response, 'AgentRouter OAuth state'))
+		except Exception as exc:
+			last_error = exc
+			await candidate_client.aclose()
+			continue
+		client = candidate_client
+		request_domain = candidate
+		break
+
+	if client is None:
+		raise ValueError('AgentRouter OAuth APIs were blocked on all official domains') from last_error
+
+	try:
+		if request_domain != provider_domain:
+			print('[INFO] Primary AgentRouter API blocked; using official backup domain')
+
+		authorize_url = 'https://github.com/login/oauth/authorize?' + urlencode(
+			{'client_id': client_id, 'state': state, 'scope': 'user:email'}
+		)
+		print('[INFO] Login page blocked; starting GitHub OAuth through AgentRouter official API')
+		try:
+			await page.goto(authorize_url, wait_until='domcontentloaded', timeout=request_timeout)
+		except Exception:
+			if '/oauth/github?' not in page.url:
+				raise
+
+		deadline = time.monotonic() + timeout_ms / 1000
+		while time.monotonic() < deadline:
+			if '/oauth/github?' in page.url:
+				break
+			await _handle_github_authorize_page(page)
+			await asyncio.sleep(0.5)
+		else:
+			raise TimeoutError('Timed out waiting for the GitHub OAuth redirect')
+
+		code, returned_state = parse_github_oauth_redirect(page.url, provider_domain, state)
+		callback_response = await client.get(
+			'/api/oauth/github',
+			params={'code': code, 'state': returned_state, 'mode': 'login'},
+		)
+		callback = parse_github_oauth_callback(
+			_read_httpx_json_response(callback_response, 'AgentRouter GitHub OAuth callback')
+		)
+		profile_response = await client.get(USER_SELF_API_SUFFIX)
+		user_profile = _extract_user_profile(_read_httpx_json_response(profile_response, 'AgentRouter user profile'))
+		if not user_profile:
+			raise ValueError('AgentRouter user profile did not include an authenticated user')
+		print(f'[INFO] Login verified via {USER_SELF_API_SUFFIX}')
+		return DirectGithubOAuthResult(
+			callback=callback,
+			user_profile=user_profile,
+			cookies=dict(client.cookies.items()),
+			request_domain=request_domain,
+		)
+	finally:
+		await client.aclose()
 
 
 async def wait_for_waf_ready(page: Page, timeout_ms: int = WAF_READY_TIMEOUT_MS) -> None:

@@ -4,7 +4,16 @@ from typing import Any
 
 import pytest
 
-from utils.browser import launch_login_context, load_browser_login_settings, parse_github_oauth_callback
+from utils.browser import (
+	is_access_verification_text,
+	launch_login_context,
+	load_browser_login_settings,
+	login_with_github_oauth_direct,
+	parse_github_oauth_callback,
+	parse_github_oauth_client_id,
+	parse_github_oauth_redirect,
+	parse_github_oauth_state,
+)
 
 
 def test_browser_login_settings_records_profile_persistence(monkeypatch, tmp_path):
@@ -139,3 +148,79 @@ def test_parse_github_oauth_callback_preserves_checkin_status(checked_in):
 
 	assert result.checked_in is checked_in
 	assert result.user['id'] == 123
+
+
+def test_access_verification_text_matches_slider_page():
+	assert is_access_verification_text('Access Verification Please slide to verify')
+	assert not is_access_verification_text('Sign in with GitHub')
+
+
+def test_parse_direct_oauth_inputs_fail_closed():
+	with pytest.raises(ValueError, match='github_client_id'):
+		parse_github_oauth_client_id({'success': True, 'data': {}})
+	with pytest.raises(ValueError, match='empty'):
+		parse_github_oauth_state({'success': True, 'data': ''})
+	with pytest.raises(ValueError, match='state did not match'):
+		parse_github_oauth_redirect(
+			'https://agentrouter.org/oauth/github?code=one-time-code&state=wrong',
+			'https://agentrouter.org',
+			'expected',
+		)
+
+
+@pytest.mark.asyncio
+async def test_direct_github_oauth_uses_official_api_and_preserves_checkin_status(monkeypatch):
+	class FakeResponse:
+		def __init__(self, payload):
+			self.payload = payload
+			self.status = 200
+
+		def json(self):
+			return self.payload
+
+	class FakeClient:
+		def __init__(self):
+			self.urls = []
+			self.cookies = {'session': 'agentrouter-session'}
+
+		async def __aenter__(self):
+			return self
+
+		async def __aexit__(self, *args):
+			return None
+
+		async def aclose(self):
+			return None
+
+		async def get(self, url, **kwargs):
+			self.urls.append(str(url))
+			if url == '/api/status':
+				return FakeResponse({'success': True, 'data': {'github_client_id': 'client-id'}})
+			if url == '/api/oauth/state':
+				return FakeResponse({'success': True, 'data': 'expected-state'})
+			if url == '/api/oauth/github':
+				return FakeResponse({'success': True, 'data': {'id': 123, 'checked_in': True}})
+			if url == '/api/user/self':
+				return FakeResponse({'success': True, 'data': {'id': 123}})
+			raise AssertionError(f'Unexpected URL: {url}')
+
+	class FakePage:
+		def __init__(self):
+			self.url = 'https://agentrouter.org/login'
+
+		async def goto(self, url, **kwargs):
+			assert 'client_id=client-id' in url
+			self.url = 'https://agentrouter.org/oauth/github?code=one-time-code&state=expected-state'
+
+	fake_client = FakeClient()
+	monkeypatch.setattr('utils.browser.httpx.AsyncClient', lambda **kwargs: fake_client)
+	page: Any = FakePage()
+
+	result = await login_with_github_oauth_direct(page, 'https://agentrouter.org', 5_000)
+
+	assert result.callback.checked_in is True
+	assert result.callback.user['id'] == 123
+	assert result.user_profile['id'] == 123
+	assert result.cookies == {'session': 'agentrouter-session'}
+	assert result.request_domain == 'https://agentrouter.org'
+	assert '/api/oauth/github' in fake_client.urls

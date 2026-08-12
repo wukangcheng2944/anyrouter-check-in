@@ -22,6 +22,7 @@ from cloakbrowser import launch_async
 from dotenv import load_dotenv
 
 from utils.browser import (
+	AccessVerificationError,
 	BrowserLoginResult,
 	has_session_cookie,
 	is_logged_in,
@@ -29,6 +30,7 @@ from utils.browser import (
 	load_browser_login_settings,
 	login_with_email_form,
 	login_with_github_oauth,
+	login_with_github_oauth_direct,
 	navigate_login_page,
 	prepare_browser_page,
 	save_login_screenshot,
@@ -284,25 +286,37 @@ async def login_with_github_session(
 	try:
 		page = await context.new_page()
 		await prepare_browser_page(page)
-		await navigate_login_page(
-			page,
-			login_url,
-			timeout_ms,
-			provider=provider_name,
-			account_name=account_name,
-		)
-		await save_login_screenshot(page, provider_name, account_name, 'before-github-oauth')
+		user_profile: dict | None
+		direct_oauth = False
+		try:
+			await navigate_login_page(
+				page,
+				login_url,
+				timeout_ms,
+				provider=provider_name,
+				account_name=account_name,
+				raise_on_access_verification=True,
+			)
+		except AccessVerificationError:
+			direct_oauth = True
 
-		callback = await login_with_github_oauth(page, timeout_ms)
-		console_url = f'{provider_config.domain}/console'
-		user_profile = await verify_browser_login(page, console_url, timeout_ms)
+		if direct_oauth:
+			direct_result = await login_with_github_oauth_direct(page, provider_config.domain, timeout_ms)
+			callback = direct_result.callback
+			user_profile = direct_result.user_profile
+			all_cookies = direct_result.cookies
+		else:
+			await save_login_screenshot(page, provider_name, account_name, 'before-github-oauth')
+			callback = await login_with_github_oauth(page, timeout_ms)
+			console_url = f'{provider_config.domain}/console'
+			user_profile = await verify_browser_login(page, console_url, timeout_ms)
+			cookies = await context.cookies()
+			all_cookies = browser_cookies_for_url(cookies, provider_config.domain)
 		if not user_profile:
 			raise RuntimeError('GitHub OAuth completed but /api/user/self could not be verified')
 		if str(callback.user.get('id')) != str(user_profile.get('id')):
 			raise RuntimeError('GitHub OAuth callback user does not match /api/user/self')
 
-		cookies = await context.cookies()
-		all_cookies = browser_cookies_for_url(cookies, provider_config.domain)
 		api_user = str(user_profile['id'])
 		claim_status = 'new credit claimed' if callback.checked_in else 'already checked in / not due'
 		print(f'[SUCCESS] {account_name}: GitHub OAuth login verified ({claim_status})')
@@ -311,6 +325,7 @@ async def login_with_github_session(
 			cookies=all_cookies,
 			api_user=api_user,
 			checked_in=callback.checked_in,
+			request_domain=direct_result.request_domain if direct_oauth else None,
 		)
 	except Exception as exc:
 		print(f'[FAILED] {account_name}: GitHub OAuth login failed: {exc}')
@@ -452,6 +467,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	all_cookies = None
 	resolved_api_user: str | None = None
 	login_checked_in: bool | None = None
+	request_domain: str | None = None
 	auth_method = None
 	if account.uses_github_oauth():
 		print(f'[INFO] {account_name}: Attempting GitHub OAuth login...')
@@ -460,6 +476,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
 			login_checked_in = login_result.checked_in
+			request_domain = login_result.request_domain
 			auth_method = 'github oauth'
 		else:
 			return False, None, None
@@ -500,6 +517,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		provider_config,
 		api_user_override=resolved_api_user,
 		login_checked_in=login_checked_in,
+		request_domain=request_domain,
 		use_proxy=provider_config.use_proxy,
 	)
 
@@ -512,6 +530,7 @@ def run_check_in_requests(
 	*,
 	api_user_override: str | None = None,
 	login_checked_in: bool | None = None,
+	request_domain: str | None = None,
 	use_proxy: bool = False,
 ) -> tuple[bool, dict | None, dict | None]:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
@@ -529,14 +548,15 @@ def run_check_in_requests(
 
 		with httpx.Client(**client_kwargs) as client:
 			client.cookies.update(all_cookies)
+			base_domain = request_domain or provider_config.domain
 
 			headers = {
 				'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
 				'Accept': 'application/json, text/plain, */*',
 				'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
 				'Accept-Encoding': 'gzip, deflate, br, zstd',
-				'Referer': provider_config.domain,
-				'Origin': provider_config.domain,
+				'Referer': base_domain,
+				'Origin': base_domain,
 				'Connection': 'keep-alive',
 				'Sec-Fetch-Dest': 'empty',
 				'Sec-Fetch-Mode': 'cors',
@@ -547,7 +567,7 @@ def run_check_in_requests(
 			if api_user:
 				headers[provider_config.api_user_key] = api_user
 
-			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+			user_info_url = f'{base_domain}{provider_config.user_info_path}'
 			user_info_before = get_user_info(client, headers, user_info_url)
 			if user_info_before and user_info_before.get('success'):
 				print(user_info_before['display'])
