@@ -18,6 +18,12 @@ class ProviderConfig:
 	login_path: str = '/login'
 	sign_in_path: str | None = '/api/user/sign_in'
 	user_info_path: str = '/api/user/self'
+	browser_user_info_path: str = '/api/user/self'
+	verification_path: str = '/console'
+	auth_refresh_path: str | None = None
+	auth_refresh_method: Literal['get', 'post'] = 'post'
+	github_state_env: str = 'AGENTROUTER_GITHUB_STATE'
+	require_check_in_status: bool = True
 	api_user_key: str = 'new-api-user'
 	bypass_method: Literal['waf_cookies'] | None = None
 	waf_cookie_names: List[str] | None = None
@@ -56,6 +62,27 @@ class ProviderConfig:
 			login_path=data.get('login_path', defaults.login_path if defaults else '/login'),
 			sign_in_path=data.get('sign_in_path', defaults.sign_in_path if defaults else '/api/user/sign_in'),
 			user_info_path=data.get('user_info_path', defaults.user_info_path if defaults else '/api/user/self'),
+			browser_user_info_path=data.get(
+				'browser_user_info_path',
+				defaults.browser_user_info_path if defaults else '/api/user/self',
+			),
+			verification_path=data.get(
+				'verification_path',
+				defaults.verification_path if defaults else '/console',
+			),
+			auth_refresh_path=data.get('auth_refresh_path', defaults.auth_refresh_path if defaults else None),
+			auth_refresh_method=data.get(
+				'auth_refresh_method',
+				defaults.auth_refresh_method if defaults else 'post',
+			),
+			github_state_env=data.get(
+				'github_state_env',
+				defaults.github_state_env if defaults else 'AGENTROUTER_GITHUB_STATE',
+			),
+			require_check_in_status=data.get(
+				'require_check_in_status',
+				defaults.require_check_in_status if defaults else True,
+			),
 			api_user_key=data.get('api_user_key', defaults.api_user_key if defaults else 'new-api-user'),
 			bypass_method=data.get('bypass_method', defaults.bypass_method if defaults else None),
 			waf_cookie_names=data.get('waf_cookie_names', defaults.waf_cookie_names if defaults else None),
@@ -104,6 +131,21 @@ class AppConfig:
 				bypass_method='waf_cookies',
 				waf_cookie_names=['acw_tc'],
 				use_proxy=True,
+				persist_profile=False,
+			),
+			'justworker': ProviderConfig(
+				name='justworker',
+				domain='https://api.justwoker.icu',
+				login_path='/sign-in',
+				sign_in_path=None,  # NewAPI executes the daily check-in during auth refresh.
+				user_info_path='/api/user/self',
+				browser_user_info_path='/api/user/auth/refresh',
+				verification_path='/dashboard/overview',
+				auth_refresh_path='/api/user/auth/refresh',
+				auth_refresh_method='post',
+				github_state_env='AGENTROUTER_GITHUB_STATE',
+				require_check_in_status=False,
+				use_proxy=False,
 				persist_profile=False,
 			),
 		}
@@ -190,7 +232,7 @@ def load_accounts_config() -> list[AccountConfig] | None:
 	"""从环境变量加载账号配置"""
 	accounts_data = []
 	configured_envs = []
-	for env_name in ('ANYROUTER_ACCOUNTS', 'AGENTROUTER_ACCOUNTS'):
+	for env_name in ('ANYROUTER_ACCOUNTS', 'AGENTROUTER_ACCOUNTS', 'JUSTWORKER_ACCOUNTS'):
 		accounts_str = os.getenv(env_name)
 		if not accounts_str:
 			continue
@@ -224,10 +266,6 @@ def load_accounts_config() -> list[AccountConfig] | None:
 			if auth_method not in {None, 'github'}:
 				print(f'ERROR: Account {i + 1} auth_method must be "github" or omitted')
 				return None
-			if auth_method == 'github' and account_dict.get('provider', 'anyrouter') != 'agentrouter':
-				print(f'ERROR: Account {i + 1} GitHub OAuth is currently supported only for agentrouter')
-				return None
-
 			if 'api_user' not in account_dict:
 				has_login = account_dict.get('email') and account_dict.get('password')
 				if not has_login and auth_method != 'github':

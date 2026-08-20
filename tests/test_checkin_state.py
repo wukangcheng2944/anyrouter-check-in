@@ -4,7 +4,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from checkin import browser_cookies_for_url, generate_balance_hash
+from checkin import browser_cookies_for_url, generate_balance_hash, parse_user_info_payload
 
 
 def test_balance_hash_changes_when_quota_changes():
@@ -46,3 +46,19 @@ def test_browser_cookies_are_filtered_to_target_domain():
 
 	assert result == {'session': 'agentrouter-session', 'acw_tc': 'waf-cookie'}
 	assert 'github-secret' not in result.values()
+
+
+def test_parse_user_info_payload_accepts_nested_auth_refresh_user():
+	result = parse_user_info_payload(
+		{
+			'success': True,
+			'data': {'access_token': 'redacted', 'user': {'quota': 45_490_232, 'used_quota': 500_000}},
+		}
+	)
+
+	assert result == {
+		'success': True,
+		'quota': 90.98,
+		'used_quota': 1.0,
+		'display': ':money: Current balance: $90.98, Used: $1.0',
+	}

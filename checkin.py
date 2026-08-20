@@ -222,8 +222,14 @@ async def login_with_credentials(
 		else:
 			print(f'[INFO] {account_name}: Browser profile already logged in')
 
-		console_url = f'{provider_config.domain}/console'
-		user_profile = await verify_browser_login(page, console_url, timeout_ms)
+		verification_url = f'{provider_config.domain}{provider_config.verification_path}'
+		user_profile = await verify_browser_login(
+			page,
+			verification_url,
+			timeout_ms,
+			user_info_path=provider_config.browser_user_info_path,
+			authenticated_path=provider_config.verification_path,
+		)
 		if not user_profile:
 			cookies = await context.cookies()
 			cookie_names = [c.get('name') for c in cookies if c.get('name')]
@@ -261,7 +267,7 @@ async def login_with_github_session(
 	"""使用 GitHub-only 浏览器登录态完成 AgentRouter OAuth 登录。"""
 	print(f'[PROCESSING] {account_name}: Logging in with GitHub OAuth...')
 	try:
-		storage_state = load_github_storage_state()
+		storage_state = load_github_storage_state(provider_config.github_state_env)
 	except ValueError as exc:
 		print(f'[FAILED] {account_name}: {exc}')
 		return None
@@ -293,9 +299,19 @@ async def login_with_github_session(
 		)
 		await save_login_screenshot(page, provider_name, account_name, 'before-github-oauth')
 
-		callback = await login_with_github_oauth(page, timeout_ms)
-		console_url = f'{provider_config.domain}/console'
-		user_profile = await verify_browser_login(page, console_url, timeout_ms)
+		callback = await login_with_github_oauth(
+			page,
+			timeout_ms,
+			require_check_in_status=provider_config.require_check_in_status,
+		)
+		verification_url = f'{provider_config.domain}{provider_config.verification_path}'
+		user_profile = await verify_browser_login(
+			page,
+			verification_url,
+			timeout_ms,
+			user_info_path=provider_config.browser_user_info_path,
+			authenticated_path=provider_config.verification_path,
+		)
 		if not user_profile:
 			raise RuntimeError('GitHub OAuth completed but /api/user/self could not be verified')
 		if str(callback.user.get('id')) != str(user_profile.get('id')):
@@ -304,7 +320,12 @@ async def login_with_github_session(
 		cookies = await context.cookies()
 		all_cookies = browser_cookies_for_url(cookies, provider_config.domain)
 		api_user = str(user_profile['id'])
-		claim_status = 'new credit claimed' if callback.checked_in else 'already checked in / not due'
+		if callback.checked_in is True:
+			claim_status = 'new credit claimed'
+		elif callback.checked_in is False:
+			claim_status = 'already checked in / not due'
+		else:
+			claim_status = 'check-in status returned by auth refresh'
 		print(f'[SUCCESS] {account_name}: GitHub OAuth login verified ({claim_status})')
 		await context.close()
 		return BrowserLoginResult(
@@ -320,26 +341,77 @@ async def login_with_github_session(
 		return None
 
 
+def parse_user_info_payload(payload: object) -> dict | None:
+	"""从 NewAPI 用户响应或 auth refresh 响应中提取余额信息。"""
+	if not isinstance(payload, dict) or payload.get('success') is not True:
+		return None
+
+	user_data = payload.get('data', {})
+	if isinstance(user_data, dict) and isinstance(user_data.get('user'), dict):
+		user_data = user_data['user']
+	if not isinstance(user_data, dict):
+		return None
+
+	quota = round(user_data.get('quota', 0) / 500000, 2)
+	used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+	return {
+		'success': True,
+		'quota': quota,
+		'used_quota': used_quota,
+		'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+	}
+
+
 def get_user_info(client, headers, user_info_url: str):
 	"""获取用户信息"""
 	try:
 		response = client.get(user_info_url, headers=headers, timeout=30)
 
 		if response.status_code == 200:
-			data = response.json()
-			if data.get('success'):
-				user_data = data.get('data', {})
-				quota = round(user_data.get('quota', 0) / 500000, 2)
-				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
-				return {
-					'success': True,
-					'quota': quota,
-					'used_quota': used_quota,
-					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
-				}
+			user_info = parse_user_info_payload(response.json())
+			if user_info:
+				return user_info
 		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
 	except Exception as e:
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
+
+
+def refresh_auth(client, headers, provider_config):
+	"""刷新 NewAPI Bearer 令牌；部分站点在该流程中执行每日签到。"""
+	if not provider_config.auth_refresh_path:
+		return None
+
+	refresh_headers = headers.copy()
+	refresh_headers['Content-Type'] = 'application/json'
+	refresh_url = f'{provider_config.domain}{provider_config.auth_refresh_path}'
+	try:
+		response = client.request(
+			provider_config.auth_refresh_method.upper(),
+			refresh_url,
+			headers=refresh_headers,
+			content=b'',
+			timeout=30,
+		)
+		if response.status_code != 200:
+			return {'success': False, 'error': f'Auth refresh failed: HTTP {response.status_code}'}
+
+		payload = response.json()
+		if payload.get('success') is not True:
+			return {'success': False, 'error': str(payload.get('message') or 'Auth refresh failed')}
+
+		data = payload.get('data')
+		if isinstance(data, dict):
+			access_token = data.get('access_token')
+			token_type = data.get('token_type', 'Bearer')
+			if access_token:
+				headers['Authorization'] = f'{token_type} {access_token}'
+
+		return {
+			'success': True,
+			'user_info': parse_user_info_payload(payload),
+		}
+	except Exception as e:
+		return {'success': False, 'error': f'Auth refresh failed: {str(e)[:50]}...'}
 
 
 async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
@@ -548,7 +620,13 @@ def run_check_in_requests(
 				headers[provider_config.api_user_key] = api_user
 
 			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-			user_info_before = get_user_info(client, headers, user_info_url)
+			refresh_result = refresh_auth(client, headers, provider_config)
+			if refresh_result is not None:
+				user_info_before = refresh_result.get('user_info')
+				if not refresh_result.get('success'):
+					print(refresh_result.get('error', 'Auth refresh failed'))
+			else:
+				user_info_before = get_user_info(client, headers, user_info_url)
 			if user_info_before and user_info_before.get('success'):
 				print(user_info_before['display'])
 			elif user_info_before:
@@ -557,12 +635,15 @@ def run_check_in_requests(
 			if provider_config.needs_manual_check_in():
 				success = execute_check_in(client, account_name, provider_config, headers)
 				user_info_after = get_user_info(client, headers, user_info_url)
-				return success, user_info_before, user_info_after
+			else:
+				user_info_after = (
+					user_info_before if refresh_result is not None else get_user_info(client, headers, user_info_url)
+				)
+				success = bool(refresh_result and refresh_result.get('success'))
 
-			user_info_after = get_user_info(client, headers, user_info_url)
-			if user_info_after and user_info_after.get('success'):
+			if success and user_info_after and user_info_after.get('success'):
 				if login_checked_in is True:
-					print(f'[SUCCESS] {account_name}: AgentRouter awarded new credit during login')
+					print(f'[SUCCESS] {account_name}: New credit awarded during login')
 				elif login_checked_in is False:
 					print(f'[INFO] {account_name}: Login succeeded; credit was already claimed or is not due yet')
 				else:

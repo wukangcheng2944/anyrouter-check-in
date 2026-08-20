@@ -10,6 +10,9 @@ def test_builtin_provider_profile_persistence_defaults(monkeypatch):
 
 	assert config.providers['anyrouter'].persist_profile is True
 	assert config.providers['agentrouter'].persist_profile is False
+	assert config.providers['justworker'].domain == 'https://api.justwoker.icu'
+	assert config.providers['justworker'].auth_refresh_path == '/api/user/auth/refresh'
+	assert config.providers['justworker'].sign_in_path is None
 
 
 def test_provider_profile_persistence_can_override_builtin(monkeypatch):
@@ -61,13 +64,30 @@ def test_github_oauth_account_needs_no_password_cookie_or_api_user(monkeypatch):
 	assert accounts[0].uses_github_oauth()
 
 
-def test_github_oauth_account_rejects_other_provider(monkeypatch):
+def test_github_oauth_account_supports_justworker(monkeypatch):
 	monkeypatch.setenv(
 		'ANYROUTER_ACCOUNTS',
-		json.dumps([{'provider': 'anyrouter', 'auth_method': 'github'}]),
+		json.dumps([{'provider': 'justworker', 'auth_method': 'github'}]),
 	)
 
-	assert load_accounts_config() is None
+	accounts = load_accounts_config()
+
+	assert accounts is not None
+	assert accounts[0].provider == 'justworker'
+	assert accounts[0].uses_github_oauth()
+
+
+def test_justworker_accounts_are_loaded_separately(monkeypatch):
+	monkeypatch.delenv('ANYROUTER_ACCOUNTS', raising=False)
+	monkeypatch.setenv(
+		'JUSTWORKER_ACCOUNTS',
+		json.dumps([{'name': 'JustDoWork', 'provider': 'justworker', 'auth_method': 'github'}]),
+	)
+
+	accounts = load_accounts_config()
+
+	assert accounts is not None
+	assert [account.name for account in accounts] == ['JustDoWork']
 
 
 def test_agentrouter_accounts_are_merged_without_overwriting_anyrouter(monkeypatch):
