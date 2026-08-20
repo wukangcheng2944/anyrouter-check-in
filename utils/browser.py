@@ -155,7 +155,7 @@ class BrowserLoginResult:
 @dataclass(frozen=True)
 class GithubOAuthCallback:
 	user: dict
-	checked_in: bool
+	checked_in: bool | None
 	message: str = ''
 
 
@@ -403,15 +403,18 @@ def _extract_user_profile(payload: object) -> dict | None:
 	if not isinstance(payload, dict):
 		return None
 	data = payload.get('data')
-	if payload.get('success') is True and isinstance(data, dict) and data.get('id'):
-		return data
+	if payload.get('success') is True and isinstance(data, dict):
+		if isinstance(data.get('user'), dict) and data['user'].get('id'):
+			return data['user']
+		if data.get('id'):
+			return data
 	if payload.get('id'):
 		return payload
 	return None
 
 
-async def _parse_user_self_response(response) -> dict | None:
-	if USER_SELF_API_SUFFIX not in response.url or response.status != 200:
+async def _parse_user_profile_response(response, api_suffix: str) -> dict | None:
+	if api_suffix not in response.url or response.status != 200:
 		return None
 	try:
 		payload = await response.json()
@@ -454,8 +457,15 @@ async def wait_for_logged_in(page: Page, timeout_ms: int = SESSION_WAIT_TIMEOUT_
 	return False
 
 
-async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) -> dict | None:
-	"""跳转 /console 并拦截 /api/user/self，用浏览器会话确认登录用户。"""
+async def verify_browser_login(
+	page: Page,
+	console_url: str,
+	timeout_ms: int,
+	*,
+	user_info_path: str = USER_SELF_API_SUFFIX,
+	authenticated_path: str = CONSOLE_PATH,
+) -> dict | None:
+	"""跳转到已登录页面并拦截用户接口，确认浏览器会话对应的用户。"""
 	verify_timeout = min(timeout_ms, SESSION_WAIT_TIMEOUT_MS)
 	captured_profile: dict | None = None
 	verified = asyncio.Event()
@@ -464,14 +474,14 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 		nonlocal captured_profile
 		if captured_profile is not None:
 			return
-		profile = await _parse_user_self_response(response)
+		profile = await _parse_user_profile_response(response, user_info_path)
 		if profile:
 			captured_profile = profile
 			verified.set()
 
 	page.on('response', on_response)
 	try:
-		print(f'[INFO] Verifying login via {console_url} and {USER_SELF_API_SUFFIX}')
+		print(f'[INFO] Verifying login via {console_url} and {user_info_path}')
 		await page.goto(console_url, wait_until='load', timeout=min(timeout_ms, 60_000))
 		try:
 			await page.wait_for_load_state('networkidle', timeout=20_000)
@@ -490,21 +500,21 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 		if is_debug_enabled():
 			user_id = captured_profile.get('id')
 			username = captured_profile.get('username', '')
-			print(f'[INFO] Login verified via {USER_SELF_API_SUFFIX}: id={user_id}, username={username}')
+			print(f'[INFO] Login verified via {user_info_path}: id={user_id}, username={username}')
 		else:
 			print('[INFO] Login verified')
 		return captured_profile
 
-	if CONSOLE_PATH in page.url.lower():
-		print(f'[WARN] Reached {CONSOLE_PATH} but {USER_SELF_API_SUFFIX} returned no user profile')
+	if authenticated_path.lower() in page.url.lower():
+		print(f'[WARN] Reached {authenticated_path} but {user_info_path} returned no user profile')
 	else:
 		debug_print(f'[WARN] Login verification failed: current URL={page.url}')
 		print('[WARN] Login verification failed')
 	return None
 
 
-def parse_github_oauth_callback(payload: object) -> GithubOAuthCallback:
-	"""解析 AgentRouter 的 GitHub OAuth 回调，签到状态缺失时拒绝猜测。"""
+def parse_github_oauth_callback(payload: object, *, require_check_in_status: bool = True) -> GithubOAuthCallback:
+	"""解析 GitHub OAuth 回调；按 provider 选择是否要求显式签到状态。"""
 	if not isinstance(payload, dict):
 		raise ValueError('GitHub OAuth callback did not return a JSON object')
 	if payload.get('success') is not True:
@@ -516,8 +526,10 @@ def parse_github_oauth_callback(payload: object) -> GithubOAuthCallback:
 		raise ValueError('GitHub OAuth callback did not include an authenticated user')
 
 	checked_in = user.get('checked_in')
-	if not isinstance(checked_in, bool):
+	if require_check_in_status and not isinstance(checked_in, bool):
 		raise ValueError('GitHub OAuth callback did not include checked_in status')
+	if not isinstance(checked_in, bool):
+		checked_in = None
 
 	return GithubOAuthCallback(
 		user=user,
@@ -570,8 +582,13 @@ async def _handle_github_authorize_page(page: Page) -> bool:
 	return bool(button and await _click_locator(button))
 
 
-async def login_with_github_oauth(page: Page, timeout_ms: int) -> GithubOAuthCallback:
-	"""点击 GitHub 登录并捕获 AgentRouter OAuth 回调中的 checked_in。"""
+async def login_with_github_oauth(
+	page: Page,
+	timeout_ms: int,
+	*,
+	require_check_in_status: bool = True,
+) -> GithubOAuthCallback:
+	"""点击 GitHub 登录并捕获 OAuth 回调。"""
 	callback_payload: object | None = None
 	callback_event = asyncio.Event()
 
@@ -605,7 +622,7 @@ async def login_with_github_oauth(page: Page, timeout_ms: int) -> GithubOAuthCal
 	finally:
 		page.remove_listener('response', on_response)
 
-	return parse_github_oauth_callback(callback_payload)
+	return parse_github_oauth_callback(callback_payload, require_check_in_status=require_check_in_status)
 
 
 async def wait_for_waf_ready(page: Page, timeout_ms: int = WAF_READY_TIMEOUT_MS) -> None:

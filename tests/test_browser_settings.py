@@ -133,6 +133,15 @@ def test_parse_github_oauth_callback_requires_checked_in():
 		parse_github_oauth_callback({'success': True, 'data': {'id': 123}})
 
 
+def test_parse_github_oauth_callback_can_skip_checked_in_for_newapi_provider():
+	result = parse_github_oauth_callback(
+		{'success': True, 'data': {'id': 123}},
+		require_check_in_status=False,
+	)
+
+	assert result.checked_in is None
+
+
 @pytest.mark.parametrize('checked_in', [True, False])
 def test_parse_github_oauth_callback_preserves_checkin_status(checked_in):
 	result = parse_github_oauth_callback({'success': True, 'data': {'id': 123, 'checked_in': checked_in}})

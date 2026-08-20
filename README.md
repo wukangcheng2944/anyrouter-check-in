@@ -82,7 +82,7 @@
 - `email` + `password`：推荐的浏览器登录方式，登录成功后会自动获取 cookies 与用户标识
 - `cookies`：兼容旧版的 session cookies 登录方式
 - `api_user`：session cookies 登录时用于请求头的 new-api-user 参数；邮箱密码登录可省略
-- `auth_method: "github"`：AgentRouter 专用，通过预先导出的 GitHub 浏览器登录态完成 OAuth；不需要邮箱、密码、cookies 或 api_user
+- `auth_method: "github"`：对支持 GitHub OAuth 的 provider，通过预先导出的 GitHub 浏览器登录态完成 OAuth；不需要邮箱、密码、cookies 或 api_user
 - `provider` (可选)：指定使用的服务商，默认为 `anyrouter`
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
 
@@ -90,7 +90,23 @@
 
 - 如果未提供 `provider` 字段，默认使用 `anyrouter`（向后兼容）
 - 如果未提供 `name` 字段，会使用 `Account 1`、`Account 2` 等默认名称
-- `anyrouter` 与 `agentrouter` 配置已内置，无需填写
+- `anyrouter`、`agentrouter` 与 `justworker` 配置已内置，无需填写
+
+### JustDoWork（api.justwoker.icu）
+
+JustDoWork 使用 NewAPI 的 GitHub OAuth 和 `new_api_refresh` 刷新流程，登录/刷新时执行每日签到。复用上面的 `AGENTROUTER_GITHUB_STATE`，并在 production Environment Secret 中新增 `JUSTWORKER_ACCOUNTS`：
+
+```json
+[
+  {
+    "name": "JustDoWork GitHub",
+    "provider": "justworker",
+    "auth_method": "github"
+  }
+]
+```
+
+workflow 会把 `JUSTWORKER_ACCOUNTS` 与现有 AnyRouter/AgentRouter 账号一起执行；不会覆盖已有账号 Secret。
 
 ### AgentRouter 使用 GitHub OAuth
 
@@ -306,10 +322,15 @@ uv run python scripts/export_github_oauth_state.py
   - `bypass_method: "waf_cookies"`（需要获取 `acw_tc`）
   - `sign_in_path: null`（查询用户信息时自动签到）
   - `use_proxy: true`
+- `justworker`：
+  - `domain: "https://api.justwoker.icu"`
+  - `sign_in_path: null`（`POST /api/user/auth/refresh` 刷新登录态时执行签到）
+  - `auth_refresh_path: "/api/user/auth/refresh"`
+  - `verification_path: "/dashboard/overview"`
 
 **重要提示**：
 
-- `PROVIDERS` 是可选的，不配置则使用内置的 `anyrouter` 和 `agentrouter`
+- `PROVIDERS` 是可选的，不配置则使用内置的 `anyrouter`、`agentrouter` 和 `justworker`
 - 自定义的 provider 配置会覆盖同名的默认配置
 
 ## 代理配置（可选）
