@@ -521,7 +521,12 @@ def parse_github_oauth_callback(payload: object, *, require_check_in_status: boo
 		message = str(payload.get('message') or 'GitHub OAuth callback failed')
 		raise ValueError(message)
 
-	user = payload.get('data')
+	user_payload = payload.get('data')
+	user = user_payload
+	if isinstance(user_payload, dict) and isinstance(user_payload.get('user'), dict):
+		user = user_payload['user'].copy()
+		if 'checked_in' not in user and 'checked_in' in user_payload:
+			user['checked_in'] = user_payload['checked_in']
 	if not isinstance(user, dict) or not user.get('id'):
 		raise ValueError('GitHub OAuth callback did not include an authenticated user')
 
