@@ -9,9 +9,33 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
 	from playwright.async_api import Page
 
-_MODAL_SELECTOR = 'div[role="dialog"][aria-modal="true"]'
-_CLOSE_ANNOUNCEMENT = re.compile(r'关闭公告|Close Notice', re.I)
-_DISMISS_TODAY = re.compile(r'今日关闭|Close Today', re.I)
+_MODAL_SELECTOR = (
+	'div[role="dialog"][aria-modal="true"], '
+	'div[role="dialog"], '
+	'div[role="alertdialog"], '
+	'div.semi-modal, '
+	'div.semi-modal-content[role="dialog"], '
+	'div[data-state="open"][role="dialog"]'
+)
+_CLOSE_ANNOUNCEMENT = re.compile(
+	r'^(?:关闭公告|Close Notice|Close|关闭|OK|好的|我知道了|Got it|Dismiss)$',
+	re.I,
+)
+_DISMISS_TODAY = re.compile(
+	r'^(?:今日关闭|Close Today|Don[\'’]t show again today|不再提示|今日不再显示)$',
+	re.I,
+)
+_CLOSE_BUTTON_SELECTORS = (
+	'button.semi-modal-close',
+	'button[aria-label*="close" i]',
+	'button:has-text("Close")',
+	'button:has-text("关闭")',
+	'button:has-text("Don\'t show again today")',
+	'button:has-text("今日关闭")',
+	'button:has-text("不再提示")',
+	'.semi-modal-header button',
+	'.semi-modal-footer button',
+)
 
 _DISMISS_MODALS_CORE_JS = """
 	const isVisible = (el) => {
@@ -26,6 +50,9 @@ _DISMISS_MODALS_CORE_JS = """
 
 	const modalSelectors = [
 		'div[role="dialog"][aria-modal="true"]',
+		'div[role="dialog"]',
+		'div[role="alertdialog"]',
+		'div[data-state="open"][role="dialog"]',
 		'div.semi-modal .semi-modal-content[role="dialog"]',
 		'div.semi-modal.semi-modal-large',
 		'div.semi-modal[role="dialog"]',
@@ -37,15 +64,18 @@ _DISMISS_MODALS_CORE_JS = """
 		'button.semi-modal-close',
 		'button[aria-label="close"]',
 		'button[aria-label="Close"]',
+		'button[aria-label*="close" i]',
 		'.semi-modal-header button',
 		'.semi-modal-footer button.semi-button-primary',
 		'.semi-modal-footer button:last-child',
 		'.semi-modal-footer button',
 	];
 
+	const closeTextRegex = /^(关闭公告|Close Notice|Close|关闭|OK|好的|我知道了|Got it|Dismiss|Don['’]t show again today|今日关闭|Close Today|不再提示|今日不再显示)$/i;
+
 	const findRoots = () => {
 		const roots = [document.body, document.documentElement];
-		for (const portal of document.querySelectorAll('div.semi-portal')) {
+		for (const portal of document.querySelectorAll('div.semi-portal, div[data-radix-portal], [id^="radix-"]')) {
 			roots.push(portal);
 		}
 		return roots;
@@ -57,12 +87,14 @@ _DISMISS_MODALS_CORE_JS = """
 		for (const root of findRoots()) {
 			if (!root) continue;
 			for (const selector of modalSelectors) {
-				for (const el of root.querySelectorAll(selector)) {
-					if (isVisible(el) && !seen.has(el)) {
-						seen.add(el);
-						modals.push(el);
+				try {
+					for (const el of root.querySelectorAll(selector)) {
+						if (isVisible(el) && !seen.has(el)) {
+							seen.add(el);
+							modals.push(el);
+						}
 					}
-				}
+				} catch (e) {}
 			}
 		}
 		return modals.sort((a, b) => {
@@ -93,22 +125,39 @@ _DISMISS_MODALS_CORE_JS = """
 
 	const findCloseButton = (modal) => {
 		for (const selector of closeSelectors) {
-			const btn = modal.querySelector(selector);
-			if (btn && isVisible(btn)) return btn;
+			try {
+				const btn = modal.querySelector(selector);
+				if (btn && isVisible(btn)) return btn;
+			} catch (e) {}
+		}
+		for (const btn of modal.querySelectorAll('button')) {
+			if (!isVisible(btn)) continue;
+			const text = (btn.innerText || btn.textContent || '').trim();
+			if (closeTextRegex.test(text)) return btn;
 		}
 		return null;
 	};
 
 	const dismissPortalButtons = () => {
 		let closed = 0;
-		for (const portal of document.querySelectorAll('div.semi-portal')) {
+		for (const portal of document.querySelectorAll('div.semi-portal, div[data-radix-portal], [id^="radix-"]')) {
 			if (!isVisible(portal) || hasLoginFields(portal)) continue;
 			for (const selector of closeSelectors) {
-				for (const btn of portal.querySelectorAll(selector)) {
-					if (isVisible(btn)) {
-						btn.click();
-						closed += 1;
+				try {
+					for (const btn of portal.querySelectorAll(selector)) {
+						if (isVisible(btn)) {
+							btn.click();
+							closed += 1;
+						}
 					}
+				} catch (e) {}
+			}
+			for (const btn of portal.querySelectorAll('button')) {
+				if (!isVisible(btn)) continue;
+				const text = (btn.innerText || btn.textContent || '').trim();
+				if (closeTextRegex.test(text)) {
+					btn.click();
+					closed += 1;
 				}
 			}
 		}
@@ -221,14 +270,16 @@ async def _dismiss_popups_playwright(page: Page) -> int:
 				except Exception:  # nosec B112
 					continue
 			else:
-				close_button = modal.locator('button.semi-modal-close, button[aria-label="close"]').first
-				try:
-					if await close_button.is_visible():
-						await close_button.click(timeout=3000)
-						closed += 1
-						round_closed = True
-				except Exception:  # nosec B110
-					pass
+				for selector in _CLOSE_BUTTON_SELECTORS:
+					close_button = modal.locator(selector).first
+					try:
+						if await close_button.is_visible():
+							await close_button.click(timeout=3000)
+							closed += 1
+							round_closed = True
+							break
+					except Exception:  # nosec B110
+						pass
 
 		if not round_closed:
 			break

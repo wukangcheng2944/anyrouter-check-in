@@ -607,7 +607,8 @@ async def login_with_github_oauth(
 			callback_payload = {'success': False, 'message': f'Invalid OAuth response (HTTP {response.status})'}
 		callback_event.set()
 
-	page.on('response', on_response)
+	context = page.context
+	context.on('response', on_response)
 	try:
 		if not await _click_github_login_entry(page):
 			raise TimeoutError('Cannot find the GitHub login button')
@@ -616,7 +617,10 @@ async def login_with_github_oauth(
 		authorize_clicked = False
 		while time.monotonic() < deadline and not callback_event.is_set():
 			if not authorize_clicked:
-				authorize_clicked = await _handle_github_authorize_page(page)
+				for p in context.pages:
+					if await _handle_github_authorize_page(p):
+						authorize_clicked = True
+						break
 			try:
 				await asyncio.wait_for(callback_event.wait(), timeout=1)
 			except TimeoutError:
@@ -625,7 +629,10 @@ async def login_with_github_oauth(
 		if not callback_event.is_set():
 			raise TimeoutError('Timed out waiting for the AgentRouter GitHub OAuth callback')
 	finally:
-		page.remove_listener('response', on_response)
+		try:
+			context.remove_listener('response', on_response)
+		except Exception:  # nosec B110
+			pass
 
 	return parse_github_oauth_callback(callback_payload, require_check_in_status=require_check_in_status)
 
